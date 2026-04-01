@@ -17,7 +17,7 @@ Stride choices and resulting token counts:
 
 With stride=4 and whisper-small (768-dim):
     Input:  (B, 1500, 768)
-    Output: (B, 375, 576)
+    Output: (B, 375, 896)
 """
 
 import torch
@@ -43,7 +43,7 @@ class SpeechMapper(nn.Module):
     def __init__(
         self,
         encoder_dim:  int   = 768,    # whisper-small; 384=tiny, 512=base, 1280=large-v3
-        lm_dim:       int   = 576,    # SmolLM2-135M embedding size
+        lm_dim:       int   = 896,    # Qwen2.5-0.5B embedding size
         conv_stride:  int   = 4,
         conv_kernel:  int   = 5,      # smaller kernel than AudioMapper — speech is denser
         expand_ratio: float = 2.0,

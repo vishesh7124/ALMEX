@@ -4,9 +4,9 @@ model/dual_encoder_lm.py
 Full dual-encoder audio language model.
 
 Architecture:
-    [OpenBEATs] → [AudioMapper]  → (B, K_a, 576) ─┐
-                                                     ├→ prefix → [SmolLM2] → text
-    [Whisper]   → [SpeechMapper] → (B, K_s, 576) ─┘
+    [OpenBEATs] → [AudioMapper]  → (B, K_a, 896) ─┐
+                                                     ├→ prefix → [Qwen2.5-0.5B] → text
+    [Whisper]   → [SpeechMapper] → (B, K_s, 896) ─┘
 
 Integration strategy: PLITS with delayed fusion (PAL finding 1).
 
@@ -35,7 +35,7 @@ Prefix length (default config):
     SpeechMapper stride=4 → 375 tokens per clip
     2 × (203 + 1 + 375 + 1) + 129 text = 1289 tokens
 
-    SmolLM2-135M context: 8192 tokens → fits.
+    Qwen2.5-0.5B context: 32768 tokens → fits easily.
 """
 
 import torch
@@ -64,7 +64,7 @@ class DualEncoderLM(nn.Module):
         whisper_encoder,  # WhisperEncoder instance
         audio_mapper,     # AudioMapper instance
         speech_mapper,    # SpeechMapper instance
-        lm_name: str = "HuggingFaceTB/SmolLM2-135M",
+        lm_name: str = "Qwen/Qwen2.5-0.5B",
     ):
         super().__init__()
 
@@ -84,12 +84,13 @@ class DualEncoderLM(nn.Module):
         print(f"[DualEncoderLM] LM loaded.")
 
         # Get embedding dimension from SmolLM2
-        if "smollm2" in self.lm_name or "smol" in self.lm_name:
+        if any(k in self.lm_name for k in ("smol", "qwen")):
             self.lm_embed_dim = self.lm.model.embed_tokens.weight.shape[1]
         elif "gpt2" in self.lm_name:
             self.lm_embed_dim = self.lm.transformer.wte.weight.shape[1]
         else:
-            raise ValueError(f"Unsupported LM: {lm_name}. Add it to __init__.")
+            # Generic fallback for Llama-family models
+            self.lm_embed_dim = self.lm.model.embed_tokens.weight.shape[1]
 
         self.lm_dtype = self._infer_lm_dtype()
 
@@ -102,14 +103,14 @@ class DualEncoderLM(nn.Module):
 
     def _embed_text(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Convert token ids to embeddings using LM's embedding layer."""
-        if "smollm2" in self.lm_name or "smol" in self.lm_name:
+        if any(k in self.lm_name for k in ("smol", "qwen")):
             return self.lm.model.embed_tokens(input_ids)
         elif "gpt2" in self.lm_name:
             return self.lm.transformer.wte(input_ids)
 
     def _infer_lm_dtype(self) -> torch.dtype:
         """Infer LM computation dtype from token embedding weights."""
-        if "smollm2" in self.lm_name or "smol" in self.lm_name:
+        if any(k in self.lm_name for k in ("smol", "qwen")):
             return self.lm.model.embed_tokens.weight.dtype
         if "gpt2" in self.lm_name:
             return self.lm.transformer.wte.weight.dtype
@@ -117,8 +118,12 @@ class DualEncoderLM(nn.Module):
 
     def _sep_embed(self, B: int, device) -> torch.Tensor:
         """Single separator token embedding, broadcast to batch."""
-        if "smollm2" in self.lm_name or "smol" in self.lm_name:
-            sep_id = torch.tensor([0], device=device)
+        if any(k in self.lm_name for k in ("smol", "qwen")):
+            # Use eos_token_id as separator (model-agnostic)
+            eos_id = getattr(self.lm.config, 'eos_token_id', 0)
+            if isinstance(eos_id, list):
+                eos_id = eos_id[0]
+            sep_id = torch.tensor([eos_id], device=device)
             sep    = self.lm.model.embed_tokens(sep_id)
         elif "gpt2" in self.lm_name:
             sep_id = torch.tensor([50256], device=device)

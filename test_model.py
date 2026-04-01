@@ -24,9 +24,9 @@ def load_all_components():
     whisper_enc = WhisperEncoder(freeze=True)
 
     print("\nCreating mappers...")
-    audio_mapper  = AudioMapper(encoder_dim=1024, lm_dim=576,
+    audio_mapper  = AudioMapper(encoder_dim=1024, lm_dim=896,
                                 conv_stride=4, conv_kernel=7)
-    speech_mapper = SpeechMapper(encoder_dim=768,  lm_dim=576,
+    speech_mapper = SpeechMapper(encoder_dim=768,  lm_dim=896,
                                  conv_stride=4, conv_kernel=5)
 
     print("\nAssembling full model...")
@@ -35,7 +35,7 @@ def load_all_components():
         whisper_encoder = whisper_enc,
         audio_mapper    = audio_mapper,
         speech_mapper   = speech_mapper,
-        lm_name         = "HuggingFaceTB/SmolLM2-135M",
+        lm_name         = "Qwen/Qwen2.5-0.5B",
     )
 
     return model
@@ -48,8 +48,7 @@ def test_prefix_shape(model, audio_path=None):
 
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
-    tokenizer.add_special_tokens({'pad_token': '!'})
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
 
     if audio_path:
         from utils.audio_loader import load_audio_10s_mono16k
@@ -91,10 +90,10 @@ def test_prefix_shape(model, audio_path=None):
     print(f"    ─────────────────────")
     print(f"    TOTAL:          {expected}")
     print()
-    print(f"  SmolLM2-135M context window: 8192 → {'✓ fits' if expected < 8192 else '✗ too long'}")
+    print(f"  Qwen2.5-0.5B context window: 32768 → {'✓ fits' if expected < 32768 else '✗ too long'}")
 
-    assert prefix.shape == (1, expected, 576), \
-        f"Shape mismatch: got {prefix.shape}, expected (1, {expected}, 576)"
+    assert prefix.shape == (1, expected, 896), \
+        f"Shape mismatch: got {prefix.shape}, expected (1, {expected}, 896)"
     print("  PASS ✓")
     return tokenizer, prefix.shape[1]
 
@@ -106,8 +105,7 @@ def test_forward_pass(model, prefix_len):
     print(f"{'='*55}")
 
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
-    tokenizer.add_special_tokens({'pad_token': '!'})
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
 
     audio   = torch.randn(1, 160000)
     prompt  = "Caption the audio."
@@ -133,8 +131,7 @@ def test_generation(model):
     print(f"{'='*55}")
 
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
-    tokenizer.add_special_tokens({'pad_token': '!'})
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
 
     audio    = torch.randn(1, 160000)
     prompt   = "Caption the audio."
@@ -168,7 +165,7 @@ def test_parameter_count(model):
         ("WhisperEncoder (frozen)",    count(model.whisper_encoder),  0),
         ("AudioMapper",                count(model.audio_mapper),     count_trainable(model.audio_mapper)),
         ("SpeechMapper",               count(model.speech_mapper),    count_trainable(model.speech_mapper)),
-        ("SmolLM2-135M",               count(model.lm),               count_trainable(model.lm)),
+        ("Qwen2.5-0.5B",              count(model.lm),               count_trainable(model.lm)),
     ]
 
     print(f"\n  {'Component':<30} {'Total':>12} {'Trainable':>12}")
@@ -181,7 +178,7 @@ def test_parameter_count(model):
     print(f"  {'─'*56}")
     print(f"  {'TOTAL':<30} {total:>12,} {total_train:>12,}")
     print()
-    print(f"  Training only mappers + SmolLM2 on A100 80GB: easily fits")
+    print(f"  Training only mappers + Qwen2.5-0.5B on A100 80GB: easily fits")
 
 
 def main():

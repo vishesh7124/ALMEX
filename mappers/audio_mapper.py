@@ -20,11 +20,11 @@ Architecture:
   CHANNEL-MIXING: Expand → GELU → Contract
     Linear(1024 → 2048)   expand 2× (richer feature space)
     GELU                  sparsity: suppresses irrelevant features
-    Linear(2048 → 576)    contract to SmolLM2 embedding dim
+    Linear(2048 → 896)    contract to Qwen2.5-0.5B embedding dim
     LayerNorm
-    → (B, 202, 576)
+    → (B, 202, 896)
   ↓
-  Prepend projected CLS: (B, 203, 576)
+  Prepend projected CLS: (B, 203, 896)
 
 Token count: 203 per 10s clip
 Prefix contribution per audio: 203 tokens
@@ -81,7 +81,7 @@ class ExpandContractMLP(nn.Module):
     activations (sparsity), letting only relevant features pass through.
     This is the same pattern used inside every transformer block.
 
-    expand_ratio=2 means: 1024 → 2048 → 576
+    expand_ratio=2 means: 1024 → 2048 → 896
     (we don't do 4× because we're going encoder_dim→lm_dim, not d→d)
     """
 
@@ -134,10 +134,10 @@ class AudioMapper(nn.Module):
     def __init__(
         self,
         encoder_dim:  int   = 1024,   # OpenBEATs-ICME hidden size
-        lm_dim:       int   = 576,    # SmolLM2-135M embedding size
+        lm_dim:       int   = 896,    # Qwen2.5-0.5B embedding size
         conv_stride:  int   = 4,      # 808 patches → 202 compressed tokens
         conv_kernel:  int   = 7,      # receptive field (7 patches ≈ 91ms)
-        expand_ratio: float = 2.0,    # MLP expand: 1024 → 2048 → 576
+        expand_ratio: float = 2.0,    # MLP expand: 1024 → 2048 → 896
         dropout:      float = 0.1,
     ):
         super().__init__()
@@ -179,7 +179,7 @@ class AudioMapper(nn.Module):
         return 1 + (self.TOTAL_PATCHES // self.conv_stride)   # 1 + 202 = 203
 
     def _process_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
-        """Process one 10s chunk: (B, 809, 1024) → (B, 203, 576)"""
+        """Process one 10s chunk: (B, 809, 1024) → (B, 203, 896)"""
         cls     = chunk[:, :1, :]    # (B, 1, 1024)
         patches = chunk[:, 1:, :]    # (B, 808, 1024)
 
@@ -190,10 +190,10 @@ class AudioMapper(nn.Module):
         patches = self.token_mix(patches)          # (B, 202, 1024)
 
         # Stage 2: channel-mixing — project 1024 → 576
-        patches = self.channel_mix(patches)        # (B, 202, 576)
+        patches = self.channel_mix(patches)        # (B, 202, 896)
         cls_out = self.cls_proj(cls)               # (B, 1, 576)
 
-        return torch.cat([cls_out, patches], dim=1)  # (B, 203, 576)
+        return torch.cat([cls_out, patches], dim=1)  # (B, 203, 896)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
