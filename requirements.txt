@@ -1,0 +1,11 @@
+torch==2.11.0
+torchaudio==2.11.0
+transformers==5.3.0
+huggingface-hub==1.8.0
+datasets==4.8.4
+soundfile==0.13.1
+numpy==2.4.3
+tensorboard==2.20.0
+tqdm==4.67.1
+einops==0.8.2
+wandb==0.26.0
