@@ -282,8 +282,10 @@ def download_audiocaps(limit=None):
         with open(mf) as f:
             for row in csv.DictReader(f):
                 yt_id = row.get('youtube_id', '')
-                start = int(row.get('start_time', 0))
-                yt_lookup[yt_id] = start
+                raw_start = row.get('start_time')
+                start = int(raw_start) if raw_start else 0
+                if yt_id:
+                    yt_lookup[yt_id] = start
 
     for out_path in tqdm(todo, desc=f"  {source}", ncols=80):
         if _pause_requested:
@@ -366,9 +368,12 @@ def download_musiccaps(limit=None):
         with open(mf) as f:
             for row in csv.DictReader(f):
                 yt_id = row.get('ytid', '')
-                start = float(row.get('start_s', 0))
-                end = float(row.get('end_s', 10))
-                yt_lookup[yt_id] = (start, end - start)
+                raw_start = row.get('start_s')
+                raw_end = row.get('end_s')
+                start = float(raw_start) if raw_start else 0
+                end = float(raw_end) if raw_end else 10
+                if yt_id:
+                    yt_lookup[yt_id] = (start, end - start)
 
     for out_path in tqdm(todo, desc=f"  {source}", ncols=80):
         if _pause_requested:
