@@ -864,6 +864,24 @@ def download_jamendo(limit=None):
     """
     from datasets import load_dataset, Audio
 
+    def _is_transient_stream_error(err: Exception) -> bool:
+        msg = str(err).lower()
+        transient_markers = [
+            "temporary failure in name resolution",
+            "name resolution",
+            "failed to resolve",
+            "connection",
+            "timed out",
+            "timeout",
+            "service unavailable",
+            "too many requests",
+            "502",
+            "503",
+            "504",
+            "reset by peer",
+        ]
+        return any(marker in msg for marker in transient_markers)
+
     source = "jamendo"
     needed = get_needed_paths(source)
     if not needed:
@@ -884,84 +902,112 @@ def download_jamendo(limit=None):
         fid = os.path.basename(p).replace(".wav", "")
         needed_ids.setdefault(fid, []).append(p)
 
-    print(f"  Loading JamendoMaxCaps from HuggingFace...")
-    try:
-        ds = load_dataset("amaai-lab/JamendoMaxCaps", split="train",
-                          streaming=True)
-        # Avoid torchcodec decoding: read raw path/bytes and convert via ffmpeg.
-        ds = ds.cast_column("audio", Audio(decode=False))
-    except Exception as e:
-        print(f"  ⚠ Failed to load JamendoMaxCaps: {e}")
-        return
-
     saved = 0
-    for item in tqdm(ds, desc=f"  {source}", total=len(needed_ids), ncols=80):
-        if _pause_requested:
-            break
+    attempt = 0
+    max_stream_retries = 8
+
+    while needed_ids and not _pause_requested:
         if limit and saved >= limit:
             break
-        if not needed_ids:
-            break
 
-        audio_info = item.get("audio") or {}
-        raw_path = str(audio_info.get("path", ""))
-        file_id = os.path.splitext(os.path.basename(raw_path))[0]
-        if file_id not in needed_ids:
-            continue
+        attempt += 1
+        if attempt == 1:
+            print(f"  Loading JamendoMaxCaps from HuggingFace...")
+        else:
+            print(f"  Resuming Jamendo stream (attempt {attempt}/{max_stream_retries + 1})...")
 
-        out_paths = needed_ids.pop(file_id)
-
-        tmp_in = None
         try:
-            bytes_data = audio_info.get("bytes")
-            if bytes_data is not None:
-                ext = os.path.splitext(raw_path)[1] or ".bin"
-                tmp_in = f"{DATA_DIR}/_tmp_jamendo_{file_id}{ext}"
-                os.makedirs(DATA_DIR, exist_ok=True)
-                with open(tmp_in, "wb") as f:
-                    f.write(bytes_data)
-                input_audio = tmp_in
-            elif raw_path and os.path.exists(raw_path):
-                input_audio = raw_path
-            else:
-                for out_path in out_paths:
-                    prog["failed"].append(out_path)
-                    prog["fail"] += 1
-                continue
+            ds = load_dataset("amaai-lab/JamendoMaxCaps", split="train",
+                              streaming=True)
+            # Avoid torchcodec decoding: read raw path/bytes and convert via ffmpeg.
+            ds = ds.cast_column("audio", Audio(decode=False))
 
-            for out_path in out_paths:
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                if os.path.exists(out_path):
-                    prog["completed"].append(out_path)
-                    prog["skip"] += 1
+            for item in tqdm(ds, desc=f"  {source}", total=len(needed_ids), ncols=80):
+                if _pause_requested:
+                    break
+                if limit and saved >= limit:
+                    break
+                if not needed_ids:
+                    break
+
+                audio_info = item.get("audio") or {}
+                raw_path = str(audio_info.get("path", ""))
+                file_id = os.path.splitext(os.path.basename(raw_path))[0]
+                if file_id not in needed_ids:
                     continue
 
-                if convert_to_wav(input_audio, out_path, sr=SAMPLE_RATE):
-                    prog["completed"].append(out_path)
-                    prog["success"] += 1
-                    saved += 1
-                else:
-                    prog["failed"].append(out_path)
-                    prog["fail"] += 1
+                out_paths = needed_ids.pop(file_id)
+
+                tmp_in = None
+                try:
+                    bytes_data = audio_info.get("bytes")
+                    if bytes_data is not None:
+                        ext = os.path.splitext(raw_path)[1] or ".bin"
+                        tmp_in = f"{DATA_DIR}/_tmp_jamendo_{file_id}{ext}"
+                        os.makedirs(DATA_DIR, exist_ok=True)
+                        with open(tmp_in, "wb") as f:
+                            f.write(bytes_data)
+                        input_audio = tmp_in
+                    elif raw_path and os.path.exists(raw_path):
+                        input_audio = raw_path
+                    else:
+                        for out_path in out_paths:
+                            prog["failed"].append(out_path)
+                            prog["fail"] += 1
+                        continue
+
+                    for out_path in out_paths:
+                        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                        if os.path.exists(out_path):
+                            prog["completed"].append(out_path)
+                            prog["skip"] += 1
+                            continue
+
+                        if convert_to_wav(input_audio, out_path, sr=SAMPLE_RATE):
+                            prog["completed"].append(out_path)
+                            prog["success"] += 1
+                            saved += 1
+                        else:
+                            prog["failed"].append(out_path)
+                            prog["fail"] += 1
+
+                        if limit and saved >= limit:
+                            break
+                except Exception:
+                    for out_path in out_paths:
+                        prog["failed"].append(out_path)
+                        prog["fail"] += 1
+                finally:
+                    if tmp_in and os.path.exists(tmp_in):
+                        try:
+                            os.remove(tmp_in)
+                        except OSError:
+                            pass
 
                 if limit and saved >= limit:
                     break
-        except Exception:
-            for out_path in out_paths:
-                prog["failed"].append(out_path)
-                prog["fail"] += 1
-        finally:
-            if tmp_in and os.path.exists(tmp_in):
-                try:
-                    os.remove(tmp_in)
-                except OSError:
-                    pass
 
-        if limit and saved >= limit:
+                if (prog["success"] + prog["fail"] + prog["skip"]) % 200 == 0:
+                    save_progress(source, prog)
+
+            # Completed one stream pass without a stream-level exception.
             break
-
-        if (prog["success"] + prog["fail"] + prog["skip"]) % 200 == 0:
+        except KeyboardInterrupt:
             save_progress(source, prog)
+            print("\n  ⏸  Jamendo download interrupted. Progress saved; re-run to resume.")
+            return
+        except Exception as e:
+            save_progress(source, prog)
+            err_line = str(e).splitlines()[0]
+            if _is_transient_stream_error(e) and attempt <= max_stream_retries:
+                backoff = min(60, 2 ** min(attempt, 6))
+                print(f"\n  ⚠ Jamendo stream interrupted: {err_line}")
+                print(f"    Retrying in {backoff}s...")
+                time.sleep(backoff)
+                continue
+            print(f"\n  ⚠ Jamendo stream failed: {err_line}")
+            print("    Progress saved. Re-run the same command to continue.")
+            break
 
     save_progress(source, prog)
 
