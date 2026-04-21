@@ -14,7 +14,7 @@ Usage:
 Sources:
     librispeech         HuggingFace (openslr/librispeech_asr)      ~12 GB
     audiocaps           YouTube via yt-dlp                          ~15 GB
-    fsd50k              HuggingFace (google/FSD50K) or Zenodo       ~27 GB
+    fsd50k              HuggingFace (Fhrozen/FSD50k) or Zenodo      ~27 GB
     wavcaps_audioset_sl HuggingFace (cvssp/WavCaps) zip             ~33 GB
     wavcaps_soundbible  HuggingFace (cvssp/WavCaps) zip             ~553 MB
     clotho              Zenodo (zenodo.org/record/3490684)           ~8 GB
@@ -187,7 +187,6 @@ def download_librispeech(limit=None):
         try:
             ds = load_dataset(
                 "openslr/librispeech_asr", split=hf_split,
-                trust_remote_code=True
             )
         except Exception as e:
             print(f"  ⚠ Failed to load {split}: {e}")
@@ -420,12 +419,10 @@ def download_musiccaps(limit=None):
 
 def download_fsd50k(limit=None):
     """
-    FSD50K from HuggingFace.
-    Repository: google/FSD50K (or manual from Zenodo)
+    FSD50K from HuggingFace files.
+    Repository: Fhrozen/FSD50k (or manual from Zenodo)
     """
-    from datasets import load_dataset
-    import soundfile as sf
-    import numpy as np
+    from huggingface_hub import hf_hub_download
 
     source = "fsd50k"
     needed = get_needed_paths(source)
@@ -442,72 +439,105 @@ def download_fsd50k(limit=None):
         print(f"  ✓ All {source} files already present.")
         return
 
-    # Build set of needed file IDs
+    # Group needed output paths by file id (same id may appear in multiple paths)
     needed_ids = {}
+    path_split_hints = {}
     for p in todo:
         fname = os.path.basename(p).replace(".wav", "")
-        needed_ids[fname] = p
-
-    # Determine which splits to load
-    splits_to_load = set()
-    for p in todo:
+        needed_ids.setdefault(fname, []).append(p)
         if "/dev/" in p:
-            splits_to_load.add("dev")
+            path_split_hints.setdefault(fname, set()).add("dev")
         elif "/eval/" in p:
-            splits_to_load.add("eval")
+            path_split_hints.setdefault(fname, set()).add("eval")
 
-    for split in sorted(splits_to_load):
+    # Build split lookup from local metadata CSVs if available
+    dev_ids = set()
+    eval_ids = set()
+    dev_csv = DATA_DIR / "metadata" / "fsd50k_ground_truth_dev.csv"
+    eval_csv = DATA_DIR / "metadata" / "fsd50k_ground_truth_eval.csv"
+
+    if dev_csv.exists():
+        with open(dev_csv) as f:
+            for row in csv.DictReader(f):
+                fid = row.get("fname", "")
+                if fid:
+                    dev_ids.add(str(fid))
+    if eval_csv.exists():
+        with open(eval_csv) as f:
+            for row in csv.DictReader(f):
+                fid = row.get("fname", "")
+                if fid:
+                    eval_ids.add(str(fid))
+
+    print("\n  Downloading FSD50K files from Hugging Face (Fhrozen/FSD50k)...")
+    print("  Files are fetched by ID from clips/dev or clips/eval.")
+
+    saved = 0
+    for file_id in tqdm(sorted(needed_ids.keys()), desc="  FSD50K", ncols=80):
         if _pause_requested:
             break
-        hf_split = "test" if split == "eval" else "train"
-        print(f"\n  Loading FSD50K {split} (HuggingFace split: {hf_split})...")
+        if limit and saved >= limit:
+            break
 
-        try:
-            ds = load_dataset(
-                "google/FSD50K", split=hf_split,
-                trust_remote_code=True
-            )
-        except Exception as e:
-            print(f"  ⚠ Failed to load FSD50K: {e}")
-            print(f"    Alternative: download from https://zenodo.org/records/4060432")
-            continue
+        out_paths = needed_ids[file_id]
 
-        saved = 0
-        for item in tqdm(ds, desc=f"  FSD50K {split}", ncols=80):
-            if _pause_requested:
+        # Resolve preferred split order from path hints, metadata, then fallback probing.
+        split_candidates = []
+        hinted = sorted(path_split_hints.get(file_id, set()))
+        split_candidates.extend(hinted)
+        if file_id in dev_ids and "dev" not in split_candidates:
+            split_candidates.append("dev")
+        if file_id in eval_ids and "eval" not in split_candidates:
+            split_candidates.append("eval")
+        if "dev" not in split_candidates:
+            split_candidates.append("dev")
+        if "eval" not in split_candidates:
+            split_candidates.append("eval")
+
+        local_src = None
+        for split in split_candidates:
+            repo_file = f"clips/{split}/{file_id}.wav"
+            try:
+                local_src = hf_hub_download(
+                    repo_id="Fhrozen/FSD50k",
+                    filename=repo_file,
+                    repo_type="dataset",
+                )
                 break
-            if limit and saved >= limit:
-                break
-
-            file_id = str(item.get("fname", item.get("id", "")))
-            if file_id not in needed_ids:
+            except Exception:
                 continue
 
-            out_path = needed_ids[file_id]
+        if local_src is None:
+            for out_path in out_paths:
+                prog["failed"].append(out_path)
+                prog["fail"] += 1
+            continue
+
+        for out_path in out_paths:
             if os.path.exists(out_path):
+                prog["completed"].append(out_path)
+                prog["skip"] += 1
                 continue
 
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            audio = item["audio"]
-            waveform = np.array(audio["array"], dtype=np.float32)
-            sr = audio["sampling_rate"]
-
-            try:
-                if sr != SAMPLE_RATE:
-                    import torchaudio, torch
-                    wav_t = torch.tensor(waveform).unsqueeze(0)
-                    wav_t = torchaudio.functional.resample(wav_t, sr, SAMPLE_RATE)
-                    waveform = wav_t.squeeze(0).numpy()
-                    sr = SAMPLE_RATE
-                sf.write(out_path, waveform, sr)
+            if convert_to_wav(local_src, out_path, sr=SAMPLE_RATE):
                 prog["completed"].append(out_path)
                 prog["success"] += 1
                 saved += 1
-            except Exception:
+            else:
                 prog["failed"].append(out_path)
                 prog["fail"] += 1
 
-        save_progress(source, prog)
+            if limit and saved >= limit:
+                break
+
+        if limit and saved >= limit:
+            break
+
+        if (prog["success"] + prog["fail"] + prog["skip"]) % 200 == 0:
+            save_progress(source, prog)
+
+    save_progress(source, prog)
 
 
 def download_clotho(limit=None):
@@ -832,9 +862,7 @@ def download_jamendo(limit=None):
     """
     JamendoMaxCaps from HuggingFace.
     """
-    from datasets import load_dataset
-    import soundfile as sf
-    import numpy as np
+    from datasets import load_dataset, Audio
 
     source = "jamendo"
     needed = get_needed_paths(source)
@@ -851,12 +879,17 @@ def download_jamendo(limit=None):
         print(f"  ✓ All {source} files already present.")
         return
 
-    needed_ids = {os.path.basename(p).replace(".wav", ""): p for p in todo}
+    needed_ids = {}
+    for p in todo:
+        fid = os.path.basename(p).replace(".wav", "")
+        needed_ids.setdefault(fid, []).append(p)
 
     print(f"  Loading JamendoMaxCaps from HuggingFace...")
     try:
         ds = load_dataset("amaai-lab/JamendoMaxCaps", split="train",
-                          trust_remote_code=True, streaming=True)
+                          streaming=True)
+        # Avoid torchcodec decoding: read raw path/bytes and convert via ffmpeg.
+        ds = ds.cast_column("audio", Audio(decode=False))
     except Exception as e:
         print(f"  ⚠ Failed to load JamendoMaxCaps: {e}")
         return
@@ -870,30 +903,65 @@ def download_jamendo(limit=None):
         if not needed_ids:
             break
 
-        file_id = str(item.get("id", item.get("track_id", "")))
+        audio_info = item.get("audio") or {}
+        raw_path = str(audio_info.get("path", ""))
+        file_id = os.path.splitext(os.path.basename(raw_path))[0]
         if file_id not in needed_ids:
             continue
 
-        out_path = needed_ids.pop(file_id)
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        out_paths = needed_ids.pop(file_id)
 
+        tmp_in = None
         try:
-            audio = item["audio"]
-            waveform = np.array(audio["array"], dtype=np.float32)
-            sr = audio["sampling_rate"]
-            if sr != SAMPLE_RATE:
-                import torchaudio, torch
-                wav_t = torch.tensor(waveform).unsqueeze(0)
-                wav_t = torchaudio.functional.resample(wav_t, sr, SAMPLE_RATE)
-                waveform = wav_t.squeeze(0).numpy()
-                sr = SAMPLE_RATE
-            sf.write(out_path, waveform, sr)
-            prog["completed"].append(out_path)
-            prog["success"] += 1
-            saved += 1
+            bytes_data = audio_info.get("bytes")
+            if bytes_data is not None:
+                ext = os.path.splitext(raw_path)[1] or ".bin"
+                tmp_in = f"{DATA_DIR}/_tmp_jamendo_{file_id}{ext}"
+                os.makedirs(DATA_DIR, exist_ok=True)
+                with open(tmp_in, "wb") as f:
+                    f.write(bytes_data)
+                input_audio = tmp_in
+            elif raw_path and os.path.exists(raw_path):
+                input_audio = raw_path
+            else:
+                for out_path in out_paths:
+                    prog["failed"].append(out_path)
+                    prog["fail"] += 1
+                continue
+
+            for out_path in out_paths:
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                if os.path.exists(out_path):
+                    prog["completed"].append(out_path)
+                    prog["skip"] += 1
+                    continue
+
+                if convert_to_wav(input_audio, out_path, sr=SAMPLE_RATE):
+                    prog["completed"].append(out_path)
+                    prog["success"] += 1
+                    saved += 1
+                else:
+                    prog["failed"].append(out_path)
+                    prog["fail"] += 1
+
+                if limit and saved >= limit:
+                    break
         except Exception:
-            prog["failed"].append(out_path)
-            prog["fail"] += 1
+            for out_path in out_paths:
+                prog["failed"].append(out_path)
+                prog["fail"] += 1
+        finally:
+            if tmp_in and os.path.exists(tmp_in):
+                try:
+                    os.remove(tmp_in)
+                except OSError:
+                    pass
+
+        if limit and saved >= limit:
+            break
+
+        if (prog["success"] + prog["fail"] + prog["skip"]) % 200 == 0:
+            save_progress(source, prog)
 
     save_progress(source, prog)
 
