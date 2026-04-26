@@ -30,8 +30,14 @@ Features:
     - Parallel downloads where possible
     - Only downloads files referenced in training JSONLs
 
+YouTube downloads (audiocaps, musiccaps):
+    YouTube blocks unauthenticated yt-dlp. You MUST provide cookies:
+    python download_audio.py --source audiocaps --cookies-from-browser chrome
+    Or export cookies to a file and use:
+    python download_audio.py --source audiocaps --cookies cookies.txt
+
 Requirements:
-    pip install yt-dlp tqdm datasets huggingface_hub
+    pip install yt-dlp tqdm datasets huggingface_hub soundfile
     sudo apt install ffmpeg
 """
 
@@ -149,11 +155,13 @@ def convert_to_wav(input_path: str, output_path: str,
 
 def download_librispeech(limit=None):
     """
-    LibriSpeech via HuggingFace datasets library.
+    LibriSpeech via HuggingFace datasets library (streaming mode).
+    Streaming avoids downloading all parquet files upfront.
     Downloads train-clean-100 and train-clean-360 splits.
     """
     from datasets import load_dataset
     import soundfile as sf
+    import numpy as np
 
     source = "librispeech"
     needed = get_needed_paths(source)
@@ -182,11 +190,13 @@ def download_librispeech(limit=None):
         if _pause_requested:
             break
         hf_split = split.replace("-", ".")  # "train-clean-360" → "train.clean.360"
-        print(f"\n  Loading HuggingFace split: {split} ({hf_split})...")
+        print(f"\n  Streaming HuggingFace split: {split} ({hf_split})...")
+        print(f"  (streaming=True — no bulk parquet download)")
 
         try:
             ds = load_dataset(
                 "openslr/librispeech_asr", split=hf_split,
+                streaming=True,
             )
         except Exception as e:
             print(f"  ⚠ Failed to load {split}: {e}")
@@ -194,8 +204,8 @@ def download_librispeech(limit=None):
 
         split_paths = [p for p in todo if f"/{split}/" in p]
 
-        # Build lookup: speaker_id/chapter_id/filename → dataset index
-        # Path format: data/audio/librispeech/train-clean-360/3686/171133/3686-171133-0001.flac
+        # Build lookup: filename_id → output_path
+        # Path: data/audio/librispeech/train-clean-360/3686/171133/3686-171133-0001.flac
         needed_ids = set()
         path_lookup = {}
         for p in split_paths:
@@ -204,30 +214,36 @@ def download_librispeech(limit=None):
             path_lookup[fname] = p
 
         saved = 0
-        for item in tqdm(ds, desc=f"  {split}", ncols=80):
+        skipped = 0
+        for item in tqdm(ds, desc=f"  {split}", total=len(split_paths), ncols=80):
             if _pause_requested:
                 break
             if limit and saved >= limit:
                 break
+            if not needed_ids:
+                break  # All needed files found
 
             file_id = item.get("id", "")
             if file_id not in needed_ids:
                 continue
 
+            # Remove from needed set so we can stop early
+            needed_ids.discard(file_id)
+
             out_path = path_lookup[file_id]
             if os.path.exists(out_path):
                 prog["completed"].append(out_path)
                 prog["skip"] += 1
+                skipped += 1
                 continue
 
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             audio = item["audio"]
-            waveform = audio["array"]
+            waveform = np.array(audio["array"], dtype=np.float32)
             sr = audio["sampling_rate"]
 
             try:
-                import numpy as np
-                # Resample if needed
+                # LibriSpeech is already 16kHz, but check anyway
                 if sr != SAMPLE_RATE:
                     import torchaudio
                     import torch
@@ -244,14 +260,46 @@ def download_librispeech(limit=None):
                 prog["failed"].append(out_path)
                 prog["fail"] += 1
 
+            # Save progress every 500 files
+            if (saved + skipped) % 500 == 0:
+                save_progress(source, prog)
+
         save_progress(source, prog)
-        print(f"    {split}: saved {saved}, skipped {prog['skip']}")
+        print(f"    {split}: saved {saved}, skipped {skipped}")
 
 
-def download_audiocaps(limit=None):
+def _ensure_deno_path():
+    """Ensure deno is on PATH (installed via deno installer to ~/.deno/bin)."""
+    deno_bin = os.path.expanduser("~/.deno/bin")
+    if deno_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = deno_bin + ":" + os.environ.get("PATH", "")
+
+
+def _yt_dlp_cmd(url, tmp_template, cookies_from_browser=None, cookies_file=None):
+    """
+    Build yt-dlp command with cookie auth + JS challenge solver.
+    YouTube requires both cookies AND a JS runtime (deno) with
+    the EJS challenge solver script.
+    """
+    _ensure_deno_path()
+    cmd = [
+        "yt-dlp", "--quiet", "--no-warnings", "-x",
+        "--audio-quality", "0",
+        "--remote-components", "ejs:github",
+        "-o", tmp_template,
+    ]
+    if cookies_from_browser:
+        cmd += ["--cookies-from-browser", cookies_from_browser]
+    elif cookies_file:
+        cmd += ["--cookies", cookies_file]
+    cmd.append(url)
+    return cmd
+
+
+def download_audiocaps(limit=None, cookies_from_browser=None, cookies_file=None):
     """
     AudioCaps via YouTube (yt-dlp).
-    Requires: yt-dlp, ffmpeg
+    Requires: yt-dlp, ffmpeg, and browser cookies for YouTube auth.
     """
     source = "audiocaps"
     needed = get_needed_paths(source)
@@ -260,12 +308,20 @@ def download_audiocaps(limit=None):
         return
 
     prog = load_progress(source)
-    done_set = set(prog["completed"])
+    done_set = set(prog["completed"] + prog["failed"])
     todo = [p for p in needed if p not in done_set and not os.path.exists(p)]
     print(f"  {source}: {len(needed):,} needed, {len(todo):,} to download")
 
     if not todo:
         print(f"  ✓ All {source} files already present.")
+        return
+
+    if not cookies_from_browser and not cookies_file:
+        print(f"\n  ⚠ YouTube requires authentication. Use one of:")
+        print(f"    python download_audio.py --source audiocaps --cookies-from-browser chrome")
+        print(f"    python download_audio.py --source audiocaps --cookies cookies.txt")
+        print(f"\n  To export cookies manually, see:")
+        print(f"    https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp")
         return
 
     # Need metadata CSV for start times
@@ -286,10 +342,16 @@ def download_audiocaps(limit=None):
                 if yt_id:
                     yt_lookup[yt_id] = start
 
+    consecutive_fails = 0
     for out_path in tqdm(todo, desc=f"  {source}", ncols=80):
         if _pause_requested:
             break
         if limit and prog["success"] >= limit:
+            break
+        # Stop if too many consecutive failures (likely auth issue)
+        if consecutive_fails >= 20:
+            print(f"\n  ⚠ 20 consecutive failures — likely a cookie/auth issue.")
+            print(f"    Try refreshing your cookies or using a different browser.")
             break
 
         # Extract youtube_id from filename: Y<youtube_id>.wav
@@ -305,28 +367,30 @@ def download_audiocaps(limit=None):
         url = f"https://www.youtube.com/watch?v={yt_id}"
 
         try:
-            r = subprocess.run([
-                "yt-dlp", "--quiet", "--no-warnings", "-x",
-                "--audio-quality", "0", "-o", tmp_template, url
-            ], capture_output=True, timeout=60)
+            cmd = _yt_dlp_cmd(url, tmp_template, cookies_from_browser, cookies_file)
+            r = subprocess.run(cmd, capture_output=True, timeout=90)
 
             if r.returncode != 0:
                 prog["failed"].append(out_path)
                 prog["fail"] += 1
+                consecutive_fails += 1
                 continue
 
             tmp_files = glob.glob(tmp_base + ".*")
             if not tmp_files:
                 prog["failed"].append(out_path)
                 prog["fail"] += 1
+                consecutive_fails += 1
                 continue
 
             if convert_to_wav(tmp_files[0], out_path, duration=10, start=start):
                 prog["completed"].append(out_path)
                 prog["success"] += 1
+                consecutive_fails = 0  # Reset on success
             else:
                 prog["failed"].append(out_path)
                 prog["fail"] += 1
+                consecutive_fails += 1
 
             # Cleanup temp
             for tf in glob.glob(tmp_base + ".*"):
@@ -336,11 +400,16 @@ def download_audiocaps(limit=None):
         except Exception:
             prog["failed"].append(out_path)
             prog["fail"] += 1
+            consecutive_fails += 1
+
+        # Save progress every 50 files
+        if (prog["success"] + prog["fail"]) % 50 == 0:
+            save_progress(source, prog)
 
     save_progress(source, prog)
 
 
-def download_musiccaps(limit=None):
+def download_musiccaps(limit=None, cookies_from_browser=None, cookies_file=None):
     """
     MusicCaps via YouTube (yt-dlp). Same method as AudioCaps.
     MusicCaps metadata has youtube_id + start_s + end_s.
@@ -352,12 +421,18 @@ def download_musiccaps(limit=None):
         return
 
     prog = load_progress(source)
-    done_set = set(prog["completed"])
+    done_set = set(prog["completed"] + prog["failed"])
     todo = [p for p in needed if p not in done_set and not os.path.exists(p)]
     print(f"  {source}: {len(needed):,} needed, {len(todo):,} to download")
 
     if not todo:
         print(f"  ✓ All {source} files already present.")
+        return
+
+    if not cookies_from_browser and not cookies_file:
+        print(f"\n  ⚠ YouTube requires authentication. Use one of:")
+        print(f"    python download_audio.py --source musiccaps --cookies-from-browser chrome")
+        print(f"    python download_audio.py --source musiccaps --cookies cookies.txt")
         return
 
     # Load MusicCaps metadata for timestamps
@@ -374,10 +449,14 @@ def download_musiccaps(limit=None):
                 if yt_id:
                     yt_lookup[yt_id] = (start, end - start)
 
+    consecutive_fails = 0
     for out_path in tqdm(todo, desc=f"  {source}", ncols=80):
         if _pause_requested:
             break
         if limit and prog["success"] >= limit:
+            break
+        if consecutive_fails >= 20:
+            print(f"\n  ⚠ 20 consecutive failures — likely a cookie/auth issue.")
             break
 
         fname = os.path.basename(out_path).replace(".wav", "")
@@ -389,10 +468,8 @@ def download_musiccaps(limit=None):
         url = f"https://www.youtube.com/watch?v={fname}"
 
         try:
-            r = subprocess.run([
-                "yt-dlp", "--quiet", "--no-warnings", "-x",
-                "--audio-quality", "0", "-o", tmp_template, url
-            ], capture_output=True, timeout=60)
+            cmd = _yt_dlp_cmd(url, tmp_template, cookies_from_browser, cookies_file)
+            r = subprocess.run(cmd, capture_output=True, timeout=90)
 
             if r.returncode == 0:
                 tmp_files = glob.glob(tmp_base + ".*")
@@ -400,12 +477,15 @@ def download_musiccaps(limit=None):
                                                 duration=duration, start=start):
                     prog["completed"].append(out_path)
                     prog["success"] += 1
+                    consecutive_fails = 0
                 else:
                     prog["failed"].append(out_path)
                     prog["fail"] += 1
+                    consecutive_fails += 1
             else:
                 prog["failed"].append(out_path)
                 prog["fail"] += 1
+                consecutive_fails += 1
 
             for tf in glob.glob(tmp_base + ".*"):
                 if tf != out_path:
@@ -413,6 +493,11 @@ def download_musiccaps(limit=None):
         except Exception:
             prog["failed"].append(out_path)
             prog["fail"] += 1
+            consecutive_fails += 1
+
+        # Save progress every 50 files
+        if (prog["success"] + prog["fail"]) % 50 == 0:
+            save_progress(source, prog)
 
     save_progress(source, prog)
 
@@ -1088,6 +1173,12 @@ def main():
                     help="Max files to download per source (for testing)")
     ap.add_argument("--status", action="store_true",
                     help="Show download status for all sources")
+    ap.add_argument("--cookies-from-browser", default=None,
+                    help="Browser to extract cookies from (chrome, firefox, edge, etc.)")
+    ap.add_argument("--cookies", default=None, dest="cookies_file",
+                    help="Path to cookies.txt file for YouTube auth")
+    ap.add_argument("--reset-failed", action="store_true",
+                    help="Clear failed list to retry previously failed downloads")
     args = ap.parse_args()
 
     if args.status:
@@ -1111,6 +1202,19 @@ def main():
     # Install signal handler
     signal.signal(signal.SIGINT, _signal_handler)
 
+    # Reset failed lists if requested
+    if args.reset_failed:
+        sources = list(DOWNLOADERS.keys()) if args.source == "all" else [args.source]
+        for src in sources:
+            if src and src in DOWNLOADERS:
+                p = load_progress(src)
+                n_failed = len(p.get("failed", []))
+                if n_failed:
+                    p["failed"] = []
+                    p["fail"] = 0
+                    save_progress(src, p)
+                    print(f"  Cleared {n_failed:,} failed entries for {src}")
+
     if args.source == "all":
         # Download recommended order (smallest/easiest first)
         order = [
@@ -1125,12 +1229,27 @@ def main():
             print(f"\n{'='*70}")
             print(f"  Downloading: {src}")
             print(f"{'='*70}")
-            DOWNLOADERS[src](limit=args.limit)
+            if src in ("audiocaps", "musiccaps"):
+                DOWNLOADERS[src](
+                    limit=args.limit,
+                    cookies_from_browser=args.cookies_from_browser,
+                    cookies_file=args.cookies_file,
+                )
+            else:
+                DOWNLOADERS[src](limit=args.limit)
     elif args.source in DOWNLOADERS:
         print(f"\n{'='*70}")
         print(f"  Downloading: {args.source}")
         print(f"{'='*70}")
-        DOWNLOADERS[args.source](limit=args.limit)
+        # Pass cookie args to YouTube downloaders
+        if args.source in ("audiocaps", "musiccaps"):
+            DOWNLOADERS[args.source](
+                limit=args.limit,
+                cookies_from_browser=args.cookies_from_browser,
+                cookies_file=args.cookies_file,
+            )
+        else:
+            DOWNLOADERS[args.source](limit=args.limit)
     else:
         print(f"\n  Unknown source: {args.source}")
         print(f"  Available: {', '.join(DOWNLOADERS.keys())}")
